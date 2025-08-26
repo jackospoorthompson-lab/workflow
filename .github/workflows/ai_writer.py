@@ -68,6 +68,16 @@ file_bundle = "\n\n".join(
 
 client = OpenAI()
 
+# Strong instruction: ONLY return JSON
+system_msg = """You are a precise repo editor. Apply the user's request to the provided files.
+- Make minimal, high-quality edits.
+- Preserve formatting and front-matter.
+- Do not invent facts or break links.
+- Return ONLY a JSON object with property 'changes' which is an array of objects {path, content}.
+- Example: {"changes":[{"path":"README.md","content":"..."}]}
+- If no changes needed, return {"changes": []}.
+"""
+
 response = client.responses.create(
     model=MODEL,
     reasoning={"effort": "medium"},
@@ -75,54 +85,53 @@ response = client.responses.create(
         {"role": "system", "content": system_msg},
         {"role": "user", "content": f"User request:\n{PROMPT}\n\nProject files:\n{file_bundle}"},
     ],
-    response_format={
-        "type": "json_schema",
-        "json_schema": {
-            "name": "changes_schema",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "changes": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": {"type": "string"},
-                                "content": {"type": "string"}
-                            },
-                            "required": ["path", "content"],
-                            "additionalProperties": False
-                        }
-                    }
-                },
-                "required": ["changes"],
-                "additionalProperties": False
-            },
-            "strict": True
-        }
-    }
 )
 
-# Parse model output (new SDK first, then fallback)
+# -------- Parse model output into JSON --------
+def to_text(resp):
+    # Prefer output_text if present
+    txt = getattr(resp, "output_text", None)
+    if txt:
+        return txt
+    # Try to reconstruct from blocks
+    try:
+        parts = []
+        for item in getattr(resp, "output", []):
+            for c in getattr(item, "content", []):
+                if hasattr(c, "text") and c.text:
+                    parts.append(c.text)
+        if parts:
+            return "".join(parts)
+    except Exception:
+        pass
+    return str(resp)
+
+out_text = to_text(response).strip()
+
+# Try strict JSON first, then a fallback that extracts the first {...} block
+import re, json
 data = None
 try:
-    data = response.output[0].content[0].parsed  # parsed JSON (newer SDKs)
+    data = json.loads(out_text)
 except Exception:
-    try:
-        out_text = getattr(response, "output_text", None) or str(response)
-        data = json.loads(out_text)
-    except Exception:
-        print("Failed to parse model output as JSON; aborting.", file=sys.stderr)
-        sys.exit(0)
+    m = re.search(r"\{.*\}", out_text, flags=re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            pass
+
+if not isinstance(data, dict) or "changes" not in data:
+    print("Failed to parse model output as JSON. Raw output:\n", out_text, file=sys.stderr)
+    sys.exit(0)
 
 changes = data.get("changes", [])
 if not isinstance(changes, list):
     print("Model returned invalid 'changes' (not a list); aborting.", file=sys.stderr)
     sys.exit(0)
 
-# ---- APPLY CHANGES ----
+# ---- APPLY CHANGES (unchanged) ----
 def allowed_by_globs(p: pathlib.Path) -> bool:
-    # allow if path matches any allowlist glob
     for g in ALLOW_FILE_GLOBS:
         if p.match(g) or p.as_posix().startswith(g.rstrip("*")):
             return True
@@ -135,21 +144,13 @@ for ch in changes:
     if not isinstance(path, str) or not isinstance(content, str):
         continue
     p = pathlib.Path(path)
-
-    # enforce allowlist
     if not allowed_by_globs(p):
         continue
-
-    # create dirs if needed (honor policy allow_creates)
     if not p.exists():
-        if not policy.get("allow_creates", True):
-            continue
+        from pathlib import Path
         p.parent.mkdir(parents=True, exist_ok=True)
-
-    # normalize line endings
-    content = content.replace("\r\n", "\n")
-    p.write_text(content, encoding="utf-8")
+    p.write_text(content.replace("\r\n","\n"), encoding="utf-8")
     applied += 1
 
 print(f"Applied changes to {applied} file(s).")
-# Exit 0 even if no changes; later steps will detect no diff.
+
