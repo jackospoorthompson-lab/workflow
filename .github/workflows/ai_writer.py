@@ -66,7 +66,11 @@ file_bundle = "\n\n".join(
     for path, content in original.items()
 )
 
-client = OpenAI()
+api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPEN_AI_KEY")
+if not api_key:
+    print("No API key found in env (tried OPENAI_API_KEY and OPEN_AI_KEY).", file=sys.stderr)
+    sys.exit(1)
+client = OpenAI(api_key=api_key)
 
 # Strong instruction: ONLY return JSON
 system_msg = """You are a precise repo editor. Apply the user's request to the provided files.
