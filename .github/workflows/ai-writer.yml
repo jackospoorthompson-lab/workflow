@@ -35,13 +35,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install "openai>=1.40.0" pyyaml gitpython
 
+      - name: Check for API key
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || secrets.OPEN_AI_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "API key is NOT set"; exit 1
+          else
+            echo "API key is set (length ${#OPENAI_API_KEY})"
+          fi
+      
       - name: Run AI Editor
         env:
-          OPENAI_API_KEY: ${{ secrets.OPEN_AI_KEY }}
-          GIT_AUTHOR_NAME: ai-bot
-          GIT_AUTHOR_EMAIL: ai-bot@users.noreply.github.com
-          GIT_COMMITTER_NAME: ai-bot
-          GIT_COMMITTER_EMAIL: ai-bot@users.noreply.github.com
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || secrets.OPEN_AI_KEY }}
           INPUT_PROMPT: ${{ github.event.inputs.prompt }}
           INPUT_PATHS: ${{ github.event.inputs.paths }}
           INPUT_MODE: ${{ github.event.inputs.mode }}
