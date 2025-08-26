@@ -1,4 +1,4 @@
-import os, glob, json, re, sys, subprocess, pathlib, yaml
+import os, glob, json, sys, subprocess, pathlib, yaml
 from openai import OpenAI
 
 ROOT = pathlib.Path(".")
@@ -36,6 +36,10 @@ def read_files():
     return files
 
 files = read_files()
+if not files:
+    print("No files matched the allowed globs; nothing to edit.")
+    sys.exit(0)
+
 total_bytes = sum(p.stat().st_size for p in files)
 if total_bytes > ALLOW_MAX_BYTES:
     print(f"Refusing: {total_bytes} bytes exceeds limit {ALLOW_MAX_BYTES}", file=sys.stderr)
@@ -47,7 +51,7 @@ def git(*args):
 # Capture original contents
 original = {str(p): p.read_text(encoding="utf-8", errors="ignore") for p in files}
 
-# Build a single instruction for structured edits
+# Instruction for structured edits
 system_msg = """You are a precise repo editor. Apply the user's request to the provided files.
 - Make minimal, high-quality edits.
 - Preserve formatting and front-matter.
@@ -56,7 +60,7 @@ system_msg = """You are a precise repo editor. Apply the user's request to the p
 - If no changes needed, return {"changes": []}.
 """
 
-# Construct a compact file bundle
+# Compact file bundle
 file_bundle = "\n\n".join(
     f"=== FILE: {path} ===\n{content}"
     for path, content in original.items()
@@ -66,59 +70,86 @@ client = OpenAI()
 
 response = client.responses.create(
     model=MODEL,
-    reasoning={"effort":"medium"},
+    reasoning={"effort": "medium"},
     input=[
-        {"role":"system","content":system_msg},
-        {"role":"user","content":f"User request:\n{PROMPT}\n\nProject files:\n{file_bundle}"}
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": f"User request:\n{PROMPT}\n\nProject files:\n{file_bundle}"},
     ],
-    text_format= { "type": "json_schema", "json_schema": {
-        "name":"changes_schema",
-        "schema": {
-            "type":"object",
-            "properties":{
-                "changes":{
-                    "type":"array",
-                    "items":{
-                        "type":"object",
-                        "properties":{
-                            "path":{"type":"string"},
-                            "content":{"type":"string"}
-                        },
-                        "required":["path","content"],
-                        "additionalProperties": False
+    response_format={
+        "type": "json_schema",
+        "json_schema": {
+            "name": "changes_schema",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "changes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"}
+                            },
+                            "required": ["path", "content"],
+                            "additionalProperties": False
+                        }
                     }
-                }
+                },
+                "required": ["changes"],
+                "additionalProperties": False
             },
-            "required":["changes"],
-            "additionalProperties": False
+            "strict": True
         }
-    }}
+    }
 )
 
-# Extract JSON from structured output
-out_text = response.output_text
+# Parse model output (new SDK first, then fallback)
+data = None
 try:
-    data = json.loads(out_text)
-except Exception as e:
-    print("Failed to parse model output as JSON; aborting.", file=sys.stderr)
-    sys.exit(0)
+    data = response.output[0].content[0].parsed  # parsed JSON (newer SDKs)
+except Exception:
+    try:
+        out_text = getattr(response, "output_text", None) or str(response)
+        data = json.loads(out_text)
+    except Exception:
+        print("Failed to parse model output as JSON; aborting.", file=sys.stderr)
+        sys.exit(0)
 
 changes = data.get("changes", [])
-# Apply only to files in the allowlist
+if not isinstance(changes, list):
+    print("Model returned invalid 'changes' (not a list); aborting.", file=sys.stderr)
+    sys.exit(0)
+
+# ---- APPLY CHANGES ----
+def allowed_by_globs(p: pathlib.Path) -> bool:
+    # allow if path matches any allowlist glob
+    for g in ALLOW_FILE_GLOBS:
+        if p.match(g) or p.as_posix().startswith(g.rstrip("*")):
+            return True
+    return False
+
 applied = 0
 for ch in changes:
-    p = pathlib.Path(ch["path"])
-    # Must be within repo and in ALLOW_FILE_GLOBS
-    if not any(p.match(gl) or p.as_posix().startswith(gl.rstrip("*")) for gl in ALLOW_FILE_GLOBS):
+    path = ch.get("path")
+    content = ch.get("content")
+    if not isinstance(path, str) or not isinstance(content, str):
         continue
+    p = pathlib.Path(path)
+
+    # enforce allowlist
+    if not allowed_by_globs(p):
+        continue
+
+    # create dirs if needed (honor policy allow_creates)
     if not p.exists():
-        # create new files only if policy allows
         if not policy.get("allow_creates", True):
             continue
         p.parent.mkdir(parents=True, exist_ok=True)
-    # tidy line endings
-    content = ch["content"].replace("\r\n","\n")
+
+    # normalize line endings
+    content = content.replace("\r\n", "\n")
     p.write_text(content, encoding="utf-8")
     applied += 1
 
 print(f"Applied changes to {applied} file(s).")
+# Exit 0 even if no changes; later steps will detect no diff.
